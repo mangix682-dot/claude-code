@@ -403,16 +403,92 @@ export async function getAllLspServers(): Promise<{
 
 ### 4.4 重复注册风险与避免方式
 
-**典型坑**：marketplace.json 内联写 `lspServers`，**同时** plugin 根目录又放 `.lsp.json`，且两边 server name 不同 → **两个 server 都注册**，同 `.cs` 扩展名对应两个 server，行为不可预期。
+**典型坑**：marketplace.json 内联写 `lspServers`，**同时** plugin 根目录又放 `.lsp.json`，且两边 server name 不同 → 两个 server 都被**注册**，但运行时行为容易被误解。下面是精确的源码事实。
 
-源码 `@/e:/claude-hub/claude-code/src/utils/plugins/lspPluginIntegration.ts:73,117` 两个 `Object.assign(servers, ...)` 是累加语义。
+#### 4.4.1 注册阶段：两个 instance 对象都被创建
 
-**避免方式（本方案做法）**：
+`@/e:/claude-hub/claude-code/src/utils/plugins/lspPluginIntegration.ts:73,117` 两个 `Object.assign(servers, ...)` 是累加语义；后续 `LSPServerManager` 给每个 server name 各创建一个 `LSPServerInstance`：
+
+```@e:/claude-hub/claude-code/src/services/lsp/LSPServerManager.ts:121-123
+        // Create server instance
+        const instance = createLSPServerInstance(serverName, config)
+        servers.set(serverName, instance)
+```
+
+#### 4.4.2 启动阶段：**lazy spawn**，只 spawn 第一个
+
+`createLSPServerInstance` **只创建对象，不 spawn 子进程**。真正的 `spawn` 在 `@/e:/claude-hub/claude-code/src/services/lsp/LSPClient.ts:98`，由 `instance.start()` 触发；而 `start()` 的唯一触发点是 `ensureServerStarted(filePath)`：
+
+```@e:/claude-hub/claude-code/src/services/lsp/LSPServerManager.ts:217-235
+  async function ensureServerStarted(
+    filePath: string,
+  ): Promise<LSPServerInstance | undefined> {
+    const server = getServerForFile(filePath)
+    if (!server) return undefined
+
+    if (server.state === 'stopped' || server.state === 'error') {
+      try {
+        await server.start()
+```
+
+`getServerForFile` 的路由规则是 **first registered wins**：
+
+```@e:/claude-hub/claude-code/src/services/lsp/LSPServerManager.ts:189-208
+  /**
+   * Get the LSP server instance for a given file path.
+   * If multiple servers handle the same extension, returns the first registered server.
+   * Returns undefined if no server handles this file type.
+   */
+  function getServerForFile(filePath: string): LSPServerInstance | undefined {
+    const ext = path.extname(filePath).toLowerCase()
+    const serverNames = extensionMap.get(ext)
+
+    if (!serverNames || serverNames.length === 0) {
+      return undefined
+    }
+
+    // Use first server (can add priority later)
+    const serverName = serverNames[0]
+```
+
+由于 `.lsp.json` 在 `loadPluginLspServers` 里**先**于 `manifest.lspServers` 合入，**`.lsp.json` 那份赢**：
+
+- ✅ `.lsp.json` 配置的 server 被 spawn 一份 Roslyn LS 进程
+- ❌ `marketplace.json` 配置的 server **永远 `state === 'stopped'`**，**不消耗 Roslyn LS 进程**
+
+#### 4.4.3 真实代价（不是双倍内存）
+
+| 代价 | 严重度 |
+|------|------|
+| 多一个 idle `LSPServerInstance` 对象 | 🟢 低（轻量 JS 对象） |
+| 路由依赖 Object 迭代顺序（ES2015+ 稳定但隐式依赖） | 🟡 中 |
+| 维护两份易漂移：改一边忘改另一边 → 重启后切到旧配置 | 🟡 中 |
+| `isLspConnected()` 仍返 true（只要有一个非 error 即 true） → LSPTool 被注册但实际跑错配置 | 🟡 中 |
+
+源码：
+
+```@e:/claude-hub/claude-code/src/services/lsp/manager.ts:100-110
+export function isLspConnected(): boolean {
+  if (initializationState === 'failed') return false
+  const manager = getLspServerManager()
+  if (!manager) return false
+  const servers = manager.getAllServers()
+  if (servers.size === 0) return false
+  for (const server of servers.values()) {
+    if (server.state !== 'error') return true
+  }
+  return false
+}
+```
+
+**结论**：两套不会"OOM 双倍"，但仍然是**坏实践**——配置漂移 + 隐式路由依赖 + 排错难度翻倍。
+
+#### 4.4.4 避免方式（本方案做法）
 
 - marketplace.json 里 `"lspServers": "./plugins/roslyn-ls/.lsp.json"`——**字符串路径形态**
 - 真实配置只在 `.lsp.json` 一处
 
-这样 §4.1 步骤 1 读 `.lsp.json` 内容 → 步骤 2 读 manifest.lspServers 路径 → **路径指向同一个文件 → 两次读到的是相同内容 → `Object.assign` 同名覆盖等于不变**，结果幂等。
+§4.1 步骤 1 读 `.lsp.json` 内容 → 步骤 2 读 manifest.lspServers 路径 → **路径指向同一个文件 → 两次读到的是相同内容 → `Object.assign` 同名覆盖等于不变**，结果幂等。
 
 > 也可以反过来：marketplace.json 内联完整 `lspServers` 对象，**不放** `.lsp.json` 文件，结果一样幂等。**不要两边都写不同的配置**。
 
@@ -505,13 +581,33 @@ export function initializeLspServerManager(): void {
 
 ### 5.3 CSharpLspAdapter 集成
 
-社区反馈 Roslyn LS 在 Claude Code 下 `hover`/`goToDefinition` 可能挂起，原因是 Claude Code LSP 客户端不响应：
+社区反馈 Roslyn LS 在 Claude Code 下 `hover`/`goToDefinition` 可能挂起，原因是 Claude Code LSP 客户端缺失对部分协议方法的响应。**精确事实**：
 
-- `workspace/configuration`
-- `client/registerCapability`
-- `window/workDoneProgress/create`
+| 协议方法 | Claude Code 内置响应 | 需要 adapter 补 |
+|---------|-------------------|----------------|
+| `workspace/configuration` | ✅ 返回 `null` 数组（见下） | ❌ 不需要 |
+| `client/registerCapability` | ❌ 缺失 | ✅ 需要 |
+| `window/workDoneProgress/create` | ❌ 缺失 | ✅ 需要 |
 
-[CSharpLspAdapter](https://github.com/Agasper/CSharpLspAdapter) 是一个 LSP 代理，拦截并响应这些请求。
+`workspace/configuration` 由 `LSPServerManager` 在每个 server 注册时挂上 handler：
+
+```@e:/claude-hub/claude-code/src/services/lsp/LSPServerManager.ts:125-137
+        // Register handler for workspace/configuration requests from the server
+        // Some servers (like TypeScript) send these even when we say we don't support them
+        instance.onRequest(
+          'workspace/configuration',
+          (params: { items: Array<{ section?: string }> }) => {
+            logForDebugging(
+              `LSP: Received workspace/configuration request from ${serverName}`,
+            )
+            // Return empty/null config for each requested item
+            // This satisfies the protocol without providing actual configuration
+            return params.items.map(() => null)
+          },
+        )
+```
+
+所以 [CSharpLspAdapter](https://github.com/Agasper/CSharpLspAdapter) 的真正价值是**补另外两个协议方法**——它仍然有用（修复 `hover` / `findReferences` 挂起），但描述要准确。
 
 安装：
 
@@ -535,6 +631,68 @@ dotnet tool install --global CSharpLspAdapter
 ```
 
 `env` 字段由 schema 的 `z.record(z.string(), z.string()).optional()` 接受（`@/e:/claude-hub/claude-code/src/utils/plugins/schemas.ts:747-750`），无需额外配置。
+
+### 5.4 使用变量替代硬编码路径
+
+把 `.lsp.json` 里的绝对路径换成变量，配置可移植（跨平台、可随 plugin 目录搬家）。
+
+源码 `@/e:/claude-hub/claude-code/src/utils/plugins/lspPluginIntegration.ts:229-291` 的 `resolvePluginLspEnvironment` 会对 `command`、`args`、`env`、`workspaceFolder` 字段做变量替换：
+
+```@e:/claude-hub/claude-code/src/utils/plugins/lspPluginIntegration.ts:255-275
+  // Resolve command path
+  if (resolved.command) {
+    resolved.command = resolveValue(resolved.command)
+  }
+
+  // Resolve args
+  if (resolved.args) {
+    resolved.args = resolved.args.map((arg: string) => resolveValue(arg))
+  }
+
+  // Resolve environment variables and add CLAUDE_PLUGIN_ROOT / CLAUDE_PLUGIN_DATA
+  const resolvedEnv: Record<string, string> = {
+    CLAUDE_PLUGIN_ROOT: plugin.path,
+    CLAUDE_PLUGIN_DATA: getPluginDataDir(plugin.source),
+    ...(resolved.env || {}),
+  }
+```
+
+支持的变量类型：
+
+| 变量 | 含义 | 例 |
+|------|------|----|
+| `${CLAUDE_PLUGIN_ROOT}` | 当前 plugin 目录的绝对路径（自动注入） | `~/.claude-custom-plugins/plugins/roslyn-ls` |
+| `${CLAUDE_PLUGIN_DATA}` | plugin 持久化数据目录（自动按 source 隔离） | `~/.claude/plugins/data/<source>` |
+| `${ENV_VAR}` | 父进程环境变量（包括 `HOME`、`USERPROFILE` 等） | `${HOME}/.dotnet/tools/...` |
+| `${user_config.KEY}` | 来自 plugin manifest `userConfig` 的用户设置 | 需先在 plugin.json 声明 |
+
+**可移植版 `.lsp.json` 示例**：
+
+```json
+{
+  "roslyn": {
+    "command": "${HOME}/.dotnet/tools/roslyn-language-server",
+    "args": [
+      "--stdio",
+      "--autoLoadProjects",
+      "--logLevel", "Information",
+      "--extensionLogDirectory", "${CLAUDE_PLUGIN_DATA}/logs"
+    ],
+    "extensionToLanguage": { ".cs": "csharp" },
+    "startupTimeout": 120000
+  }
+}
+```
+
+**Windows 注意**：`${HOME}` 在 Windows PowerShell 下通常未设，用 `${USERPROFILE}`；或用 `${CLAUDE_PLUGIN_ROOT}` 引相对路径。
+
+**好处**：
+
+- plugin 目录可以移动 / 跨机同步（路径不绑死）
+- 一份 `.lsp.json` 跨 Windows / macOS / Linux 通用
+- 日志默认进 `${CLAUDE_PLUGIN_DATA}/logs`，按 plugin 自动隔离（`CLAUDE_PLUGIN_DATA` 由 Claude Code 创建；子目录 `logs` 视 Roslyn LS 版本，必要时仍需手动创建）
+
+**未解析变量的行为**：源码 `@/e:/claude-hub/claude-code/src/utils/plugins/lspPluginIntegration.ts:283-289` 会把缺失变量收集后输出 warn 日志，但**不会阻止启动**——server 拿到未解析的 `${X}` 字面量当路径，启动时报 ENOENT。
 
 ---
 
